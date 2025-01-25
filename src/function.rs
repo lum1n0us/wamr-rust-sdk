@@ -11,8 +11,9 @@ use wamr_sys::{
     wasm_exec_env_t, wasm_func_get_param_count, wasm_func_get_result_count,
     wasm_func_get_result_types, wasm_function_inst_t, wasm_runtime_call_wasm,
     wasm_runtime_get_exception, wasm_runtime_get_exec_env_singleton,
-    wasm_runtime_get_wasi_exit_code, wasm_runtime_lookup_function, wasm_valkind_enum_WASM_F32,
-    wasm_valkind_enum_WASM_F64, wasm_valkind_enum_WASM_I32, wasm_valkind_enum_WASM_I64,
+    wasm_runtime_get_wasi_exit_code, wasm_runtime_lookup_function,
+    wasm_valkind_enum_WASM_EXTERNREF, wasm_valkind_enum_WASM_F32, wasm_valkind_enum_WASM_F64,
+    wasm_valkind_enum_WASM_FUNCREF, wasm_valkind_enum_WASM_I32, wasm_valkind_enum_WASM_I64,
     wasm_valkind_t,
 };
 
@@ -51,20 +52,46 @@ impl<'instance> Function<'instance> {
     fn parse_result(
         &self,
         result: Vec<u32>,
-        result_count: u32,
-        result_type: wasm_valkind_t,
-    ) -> Result<WasmValue, RuntimeError> {
-        if result_count == 0 {
-            return Ok(WasmValue::Void);
+        result_types: Vec<wasm_valkind_t>,
+    ) -> Result<Vec<WasmValue>, RuntimeError> {
+        if result_types.is_empty() {
+            return Ok(vec![WasmValue::Void]);
         }
 
-        match result_type as u32 {
-            wasm_valkind_enum_WASM_I32 => Ok(WasmValue::decode_to_i32(result)),
-            wasm_valkind_enum_WASM_I64 => Ok(WasmValue::decode_to_i64(result)),
-            wasm_valkind_enum_WASM_F32 => Ok(WasmValue::decode_to_f32(result)),
-            wasm_valkind_enum_WASM_F64 => Ok(WasmValue::decode_to_f64(result)),
-            _ => Err(RuntimeError::NotImplemented),
+        let mut results = Vec::with_capacity(result_types.len());
+        let mut index: usize = 0;
+
+        for result_type in result_types.iter() {
+            match *result_type as u32 {
+                wasm_valkind_enum_WASM_I32
+                | wasm_valkind_enum_WASM_FUNCREF
+                | wasm_valkind_enum_WASM_EXTERNREF => {
+                    results.push(WasmValue::decode_to_i32(vec![result[index]]));
+                    index += 1;
+                }
+                wasm_valkind_enum_WASM_I64 => {
+                    results.push(WasmValue::decode_to_i64(vec![
+                        result[index],
+                        result[index + 1],
+                    ]));
+                    index += 2;
+                }
+                wasm_valkind_enum_WASM_F32 => {
+                    results.push(WasmValue::decode_to_f32(vec![result[index]]));
+                    index += 1;
+                }
+                wasm_valkind_enum_WASM_F64 => {
+                    results.push(WasmValue::decode_to_f64(vec![
+                        result[index],
+                        result[index + 1],
+                    ]));
+                    index += 2;
+                }
+                _ => return Err(RuntimeError::NotImplemented),
+            }
         }
+
+        Ok(results)
     }
 
     /// execute an export function.
@@ -77,9 +104,12 @@ impl<'instance> Function<'instance> {
         &self,
         instance: &'instance Instance<'instance>,
         params: &Vec<WasmValue>,
-    ) -> Result<WasmValue, RuntimeError> {
+    ) -> Result<Vec<WasmValue>, RuntimeError> {
         let param_count =
             unsafe { wasm_func_get_param_count(self.function, instance.get_inner_instance()) };
+        let result_count =
+            unsafe { wasm_func_get_result_count(self.function, instance.get_inner_instance()) };
+
         if param_count > params.len() as u32 {
             return Err(RuntimeError::ExecutionError(ExecError {
                 message: "invalid parameters".to_string(),
@@ -87,30 +117,34 @@ impl<'instance> Function<'instance> {
             }));
         }
 
-        // params -> Vec<u32>
         let mut argv = Vec::new();
         for p in params {
             argv.append(&mut p.encode());
         }
 
-        let result_count =
-            unsafe { wasm_func_get_result_count(self.function, instance.get_inner_instance()) };
-
-        let mut result_type: wasm_valkind_t = 0;
+        let mut result_types = vec![0u8; result_count as usize];
         unsafe {
             wasm_func_get_result_types(
                 self.function,
                 instance.get_inner_instance(),
-                &mut result_type,
+                result_types.as_mut_ptr(),
             );
         }
 
-        let result_length = match result_type as u32 {
-            wasm_valkind_enum_WASM_I32 | wasm_valkind_enum_WASM_I64 => 1,
-            wasm_valkind_enum_WASM_I64 | wasm_valkind_enum_WASM_F64 => 2,
-            _ => 0,
-        };
-        argv.resize(std::cmp::max(param_count, result_length) as usize, 0);
+        // check and expand buffer size if required
+        let result_length: usize = result_types.iter().fold(0, |acc, result_type| {
+            acc + match *result_type as u32 {
+                wasm_valkind_enum_WASM_I32
+                | wasm_valkind_enum_WASM_F32
+                | wasm_valkind_enum_WASM_EXTERNREF
+                | wasm_valkind_enum_WASM_FUNCREF => 1,
+                wasm_valkind_enum_WASM_I64 | wasm_valkind_enum_WASM_F64 => 2,
+                _ => 0,
+            }
+        });
+        if result_length > argv.len() {
+            argv.resize(result_length, 0);
+        }
 
         let call_result: bool;
         unsafe {
@@ -131,7 +165,8 @@ impl<'instance> Function<'instance> {
             }
         }
 
-        self.parse_result(argv, result_count, result_type)
+        // there is no out of bounds problem, because we precalculated the safe vec size
+        self.parse_result(argv, result_types)
     }
 }
 
@@ -174,12 +209,12 @@ mod tests {
         let params: Vec<WasmValue> = vec![WasmValue::I32(3), WasmValue::I32(6)];
         let call_result = function.call(instance, &params);
         assert!(call_result.is_ok());
-        assert_eq!(call_result.unwrap(), WasmValue::I32(9));
+        assert_eq!(call_result.unwrap(), vec![WasmValue::I32(9)]);
 
         let params: Vec<WasmValue> = vec![WasmValue::I32(128), WasmValue::I32(256)];
         let call_result = function.call(instance, &params);
         assert!(call_result.is_ok());
-        assert_eq!(call_result.unwrap(), WasmValue::I32(384));
+        assert_eq!(call_result.unwrap(), vec![WasmValue::I32(384)]);
     }
 
     #[test]
@@ -208,11 +243,11 @@ mod tests {
 
         let params: Vec<WasmValue> = vec![WasmValue::I32(9), WasmValue::I32(27)];
         let result = function.call(instance, &params);
-        assert_eq!(result.unwrap(), WasmValue::I32(9));
+        assert_eq!(result.unwrap(), vec![WasmValue::I32(9)]);
 
         let params: Vec<WasmValue> = vec![WasmValue::I32(0), WasmValue::I32(27)];
         let result = function.call(instance, &params);
-        assert_eq!(result.unwrap(), WasmValue::I32(27));
+        assert_eq!(result.unwrap(), vec![WasmValue::I32(27)]);
     }
 
     #[test]
