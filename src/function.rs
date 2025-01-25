@@ -50,22 +50,12 @@ impl<'instance> Function<'instance> {
     #[allow(non_upper_case_globals)]
     fn parse_result(
         &self,
-        instance: &Instance<'instance>,
         result: Vec<u32>,
+        result_count: u32,
+        result_type: wasm_valkind_t,
     ) -> Result<WasmValue, RuntimeError> {
-        let result_count =
-            unsafe { wasm_func_get_result_count(self.function, instance.get_inner_instance()) };
         if result_count == 0 {
             return Ok(WasmValue::Void);
-        }
-
-        let mut result_type: wasm_valkind_t = 0;
-        unsafe {
-            wasm_func_get_result_types(
-                self.function,
-                instance.get_inner_instance(),
-                &mut result_type,
-            );
         }
 
         match result_type as u32 {
@@ -103,10 +93,24 @@ impl<'instance> Function<'instance> {
             argv.append(&mut p.encode());
         }
 
-        // Maintain sufficient allocated space in the vector rather than just declaring its capacity.
         let result_count =
             unsafe { wasm_func_get_result_count(self.function, instance.get_inner_instance()) };
-        argv.resize(std::cmp::max(param_count, result_count) as usize, 0);
+
+        let mut result_type: wasm_valkind_t = 0;
+        unsafe {
+            wasm_func_get_result_types(
+                self.function,
+                instance.get_inner_instance(),
+                &mut result_type,
+            );
+        }
+
+        let result_length = match result_type as u32 {
+            wasm_valkind_enum_WASM_I32 | wasm_valkind_enum_WASM_I64 => 1,
+            wasm_valkind_enum_WASM_I64 | wasm_valkind_enum_WASM_F64 => 2,
+            _ => 0,
+        };
+        argv.resize(std::cmp::max(param_count, result_length) as usize, 0);
 
         let call_result: bool;
         unsafe {
@@ -127,7 +131,7 @@ impl<'instance> Function<'instance> {
             }
         }
 
-        self.parse_result(instance, argv)
+        self.parse_result(argv, result_count, result_type)
     }
 }
 
